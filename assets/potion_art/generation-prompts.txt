@@ -1,0 +1,77 @@
+AI Passport Potion Game - Stable Pixel Art Prompt Set v1
+
+Shared visual specification
+Use case: stylized-concept
+Asset type: embedded game item sprite atlas for a 240x320 LCD
+Primary request: create crisp, readable pixel-art inventory sprites for an original pocket alchemy game
+Style/medium: hand-authored 16-bit-era pixel art, hard square pixels, no anti-aliasing, no gradients, limited color ramps, one-pixel dark outline and selective one-pixel highlights
+Composition/framing: every item is centered in its own equal square cell, identical scale and viewing angle, at least 10% clear padding around every silhouette, no overlap between cells
+Lighting/mood: soft magical glow expressed only with clustered pixels; mysterious, warm and playful
+Color palette: deep aubergine outlines, muted teal, moss green, copper, amber, moon blue and restrained magenta; maximum about 12 colors per sprite
+Materials/textures: readable at 32x32 pixels, chunky silhouettes and distinct material texture
+Text: none
+Constraints: exactly the requested grid and item order; transparent background; each cell contains exactly one isolated item; consistent outline, scale, lighting and pixel density; original design; production-ready sprite sheet
+Avoid: words, letters, numbers, labels, UI frames, cell borders, watermark, logo, characters, hands, scenery, cast shadows outside each cell, smooth vector edges, painterly brushwork, blur, noise, 3D render, photorealism
+
+Prompt A - Material atlas
+Grid: exactly 4 columns by 3 rows, twelve equal cells.
+Items left-to-right, top-to-bottom:
+1. a single bright dew drop with a tiny cyan sparkle
+2. a compact tuft of emerald moss on one dark pebble
+3. an amber pine-resin nugget with a trapped gold glint
+4. a small pile of angular copper sand crystals
+5. three curled pale-teal mist leaves
+6. a crescent-shaped pinch of blue-white moon salt
+7. one translucent lime firefly stone glowing from its core
+8. a gnarled piece of ancient wood with one green rune-like natural grain, no readable symbol
+9. a faceted midnight crystal with violet highlights
+10. a tiny storm seed with a yellow lightning-shaped crack, no text
+11. a small cluster of silver-blue stardust motes around one star-shaped crystal
+12. one red-gold dragon scale with a dark rim
+
+Prompt B - Potion atlas
+Grid: exactly 3 columns by 2 rows, six equal cells.
+Bottle design system: squat round alchemist bottles with short corks, the same silhouette family, distinct liquid and stopper ornament, transparent glass shown with pixel clusters.
+Items left-to-right, top-to-bottom:
+1. Glimmer potion: warm amber liquid, tiny floating light motes
+2. Clarity potion: cool cyan liquid, clean eye-shaped glass highlight without a literal eye
+3. Guard potion: moss-green liquid, small shield-like wax seal without text
+4. Fortune potion: magenta liquid, tiny gold clover-shaped sparkle
+5. Starry-night potion: deep indigo liquid with silver star specks and a crescent stopper charm
+6. Dragon-breath potion: red-orange liquid, horned cork collar and a restrained flame-shaped glow
+
+Prompt C - Brewing atlas
+Grid: exactly 3 columns by 1 row, three equal cells.
+Canvas intent: each source cell will be converted to a 96x80 sprite.
+Items left-to-right:
+1. a large empty black iron alchemy cauldron, copper rim, two short handles, three tiny teal runes without readable symbols
+2. the same cauldron gently brewing, teal and amber bubbles, faint purple steam contained inside the cell
+3. the same cauldron completing a brew, bright gold rim light, teal liquid splash and compact star sparks contained inside the cell
+
+Prompt D - Muddy potion atlas
+Grid: exactly 3 columns by 1 row, three equal cells.
+Canvas intent: each source cell will be converted to a 48x48 sprite.
+Items: three variants of the same squat round failed-potion bottle family, with opaque muddy brown-purple liquid, uneven bubbles, cork stopper and distinct copper, teal, then violet sediment accents. The variants must remain recognizable as the same potion type.
+
+Prompt E - Property icon atlas
+Grid: exactly 4 columns by 2 rows, eight equal cells.
+Canvas intent: each source cell will be converted to a 24x24 icon.
+Items left-to-right, top-to-bottom:
+1. herb: one broad green leaf
+2. mineral: one angular copper crystal
+3. light: one compact gold four-point sparkle
+4. dark: one deep-violet crescent shadow
+5. fire: one orange flame
+6. cold: one cyan six-branch snowflake
+7. thunder: one yellow lightning bolt
+8. dragon: one red-gold dragon scale
+
+Prompt F - Navigation icon atlas
+Grid: exactly 3 columns by 2 rows, six equal cells.
+Canvas intent: each source cell will be converted to a 40x40 icon.
+Items left-to-right, top-to-bottom: radar scope, material satchel, alchemy cauldron, open recipe book, potion display bottle on a tiny pedestal, copper settings gear. No UI frames and no text.
+
+Prompt G - Radar status atlas
+Grid: exactly 3 columns by 1 row, three equal cells.
+Canvas intent: each source cell will be converted to a 20x20 icon.
+Items left-to-right: collectable teal sparkle with a small check-like glint but no literal text glyph, cooling copper hourglass, approach signal made of three curved teal pulse marks. Bold silhouettes readable at 20x20.

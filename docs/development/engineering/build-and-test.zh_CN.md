@@ -7,6 +7,24 @@
 使用 ESP-IDF 5.5.3。全新机器或缺少工具链时，先按
 [环境引导](environment-setup.zh_CN.md)完成安装。
 
+在 Windows 上，可通过仓库构建脚本用一条命令依次执行静态检查、隔离固件构建、
+合并镜像校验和调试产物归档流程：
+
+```powershell
+.\tools\build-firmware.ps1
+```
+
+使用 `-Mode Static` 或 `-Mode Firmware` 可以只运行其中一部分。ESP-IDF 安装在
+脚本未检测到的位置时，可传入 `-IdfPath`、`-IdfToolsPath` 和 `-PythonPath`。
+静态检查通过 WSL 运行；默认发行版没有主机测试依赖时，使用
+`-WslDistribution <name>` 指定发行版。
+
+每次运行都会输出稳定的 `KEY=VALUE` 结果行，失败时返回非零退出码，并把完整日志
+写入 `build/logs/`。机器可读的结果固定更新到
+`build/last-build-result.json`。固件构建失败时会保留隔离构建目录，并在
+`retained_validation_build` 中记录路径，便于诊断。成功时默认删除该临时目录；
+传入 `-KeepBuildDirectory` 可以保留。该脚本不会刷写设备。
+
 > **向设备下载（烧录）新固件前，无需备份设备内部原有固件。** 不要求先读出
 > 原固件，也不把原固件备份作为烧录前置条件。烧录会覆盖原固件，不会自动恢复
 > 原固件。这不代表用户数据会被保留：如果需要保留已有设置或记录，应事先

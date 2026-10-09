@@ -1,242 +1,201 @@
-// main/main.c —— FoloToy AI Passport BSP 驱动参考示例:初始化 + 菜单 + 按键分发。
-//
-// 按键语义(全局统一):
-//   上/下 短按   菜单中=移动选中项;演示页中=该页自定义
-//   确定  短按   菜单中=进入选中项;演示页中=该页自定义
-//   确定  长按   演示页中=返回菜单(由本文件统一拦截)
-#include "bsp_i2c.h"
-#include "bsp_display.h"
-#include "bsp_button.h"
+// Pocket Alchemist: an original application for FoloToy AI Passport.
 #include "bsp_audio.h"
 #include "bsp_battery.h"
-#include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
-#include "demo.h"
-#include "demo_navigation.h"
-#include "ui_pixel.h"
-#include "lvgl.h"
+#include "bsp_button.h"
+#include "bsp_display.h"
+#include "bsp_i2c.h"
+#include "bsp_pins.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "lvgl.h"
+#include "potion_assets.h"
+#include "potion_model.h"
+#include "potion_radio.h"
+#include "potion_store.h"
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
 
-static const char *TAG = "main";
+LV_FONT_DECLARE(potion_font_16);
 
-static const demo_entry_t DEMOS[] = {
-    { .name = "Display", .enter = demo_display_enter, .exit = demo_display_exit,
-      .key = demo_display_key },
-    { .name = "Button", .enter = demo_button_enter, .exit = demo_button_exit,
-      .key = demo_button_key },
-    { .name = "Audio", .enter = demo_audio_enter, .exit = demo_audio_exit,
-      .key = demo_audio_key, .start = demo_audio_start, .stop = demo_audio_stop },
-    { .name = "Battery", .enter = demo_battery_enter, .exit = demo_battery_exit,
-      .key = demo_battery_key },
-    { .name = "Wi-Fi", .enter = demo_wifi_enter, .exit = demo_wifi_exit,
-      .key = demo_wifi_key, .start = demo_wifi_start, .stop = demo_wifi_stop },
-    { .name = "BLE", .enter = demo_ble_enter, .exit = demo_ble_exit,
-      .key = demo_ble_key, .start = demo_ble_start, .stop = demo_ble_stop },
-    { .name = "Low Power", .enter = demo_low_power_enter, .exit = demo_low_power_exit,
-      .key = demo_low_power_key, .start = demo_low_power_start, .stop = demo_low_power_stop },
+#define APP_QUEUE_DEPTH 12
+#define APP_POLL_MS 250U
+#define SCREEN_BACKLIGHT 90U
+#define APP_VERSION "v0.0.1"
+#define COOLDOWN_CHECKPOINT_MS 60000U
+#define SCREEN_TIMEOUT_COUNT 5U
+#define RADAR_IDLE_MS 180000U
+#define AUTO_SHUTDOWN_GRACE_MS 5000U
+#define SIGNAL_THRESHOLD_DEFAULT 66U
+#define SIGNAL_RELAX_MS 45000U
+#define NO_SIGNAL_FALLBACK_MS 120000U
+#define VIRTUAL_RESOURCE_COUNT 10U
+#define RADAR_POINT_MAX 10U
+#define RADAR_CARD_MAX 3U
+#define COLOR_VOID 0x100D19
+#define COLOR_PANEL 0x241B33
+#define COLOR_PANEL_2 0x332443
+#define COLOR_INK 0xF7E9C5
+#define COLOR_MUTED 0xA99BB7
+#define COLOR_GOLD 0xF5B94C
+#define COLOR_TEAL 0x66D9C8
+#define COLOR_BAD 0xE56B6F
+#define COLOR_RING 0x4F3E61
+
+static const char *TAG="potion_app";
+static const char *HOME_NAMES[]={"探索材料","材料仓库","炼制药剂","配方手册","药剂展示","设置"};
+static const char *RARITY_NAMES[]={"普通","稀有","史诗","传说"};
+static const char *ATTR_NAMES[]={"草木","矿物","光","暗","火","寒","雷","龙"};
+static const char *DURATION_UNITS[]={"秒","分","时","天"};
+static const char *SCREEN_TIMEOUT_NAMES[]={"30秒","1分钟","3分钟","5分钟","关闭"};
+static const uint32_t SCREEN_TIMEOUT_MS[]={30000U,60000U,180000U,300000U,0U};
+static const uint32_t MATERIAL_COLORS[POTION_MATERIAL_COUNT]={
+    0x66D9C8,0xF5B94C,0xE56B6F,0x7AA2F7,0xBB9AF7,0x9ECE6A,
+    0xFF9E64,0x2AC3DE,0xC0CAF5,0xF7768E,0xE0AF68,0x73DACA,
 };
-#define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
-#define INPUT_QUEUE_DEPTH 8
 
-typedef struct {
-    bsp_btn_t btn;
-    bsp_btn_ev_t event;
-} input_event_t;
+typedef enum {
+    PAGE_HOME,PAGE_SCANNING,PAGE_RADAR,PAGE_COLLECTION_REWARD,PAGE_INVENTORY,PAGE_MATERIAL_DETAIL,
+    PAGE_CAULDRON,PAGE_BREW_RESULT,PAGE_RECIPE_POTIONS,PAGE_RECIPE_HISTORY,
+    PAGE_SHOWCASE,PAGE_SETTINGS,PAGE_LAB_LIST,PAGE_MESSAGE
+} page_t;
+typedef enum {SCAN_EXPLORE,SCAN_LAB_CHECK,SCAN_LAB_REGISTER} scan_mode_t;
+typedef enum {RADIO_RESUME_NONE,RADIO_RESUME_SCAN,RADIO_RESUME_SHOWCASE} radio_resume_t;
+typedef enum {EVENT_KEY,EVENT_RADIO} app_event_kind_t;
+typedef struct {app_event_kind_t kind;bsp_btn_t button;bsp_btn_ev_t action;} app_event_t;
+typedef struct {potion_explore_progress_t progress;uint32_t last_seen_scan;} explore_track_t;
+typedef struct {uint64_t fingerprint;uint32_t unlock_delay_ms;uint8_t locked_strength;} virtual_resource_t;
 
-// 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
-static bool s_ok[DEMO_COUNT];
+static QueueHandle_t s_queue,s_radio_queue;
+static potion_player_t s_player;
+/* Mutations run on app_task, so one static candidate avoids 2360-byte stack frames. */
+static potion_player_t s_candidate;
+static page_t s_page,s_message_return=PAGE_HOME,s_material_detail_return=PAGE_INVENTORY;
+static scan_mode_t s_scan_mode;
+static radio_resume_t s_radio_resume;
+static potion_idle_t s_idle;
+static unsigned s_selected,s_home_selected;
+static uint32_t s_request_id,s_session_id,s_explore_started_ms,s_last_cooldown_checkpoint_ms,s_screen_off_started_ms;
+static bool s_shutdown_started;
+static potion_radio_event_t s_last_scan;
+static potion_radio_event_t s_radio_dispatch;
+static potion_material_signal_t s_scan_signals[POTION_SCAN_MAX];
+static size_t s_scan_signal_count;
+static potion_radar_item_t s_radar[RADAR_CARD_MAX];
+static size_t s_radar_count;
+static potion_radar_item_t s_radar_points[RADAR_POINT_MAX];
+static size_t s_radar_point_count;
+static explore_track_t s_explore_tracks[POTION_SCAN_MAX];
+static uint32_t s_explore_scan_generation;
+static uint32_t s_threshold_wait_started_ms,s_last_real_signal_ms,s_virtual_started_ms;
+static uint8_t s_signal_threshold=SIGNAL_THRESHOLD_DEFAULT;
+static virtual_resource_t s_virtual_resources[VIRTUAL_RESOURCE_COUNT];
+static bool s_virtual_active;
+static potion_explore_progress_t s_progress[RADAR_CARD_MAX];
+static uint8_t s_progress_value[RADAR_CARD_MAX];
+static uint16_t s_cauldron[POTION_CAULDRON_SLOTS];
+static uint8_t s_cauldron_count;
+static uint16_t s_result_potion;
+static uint16_t s_recipe_potion;
+static uint16_t s_material_detail_id;
+static uint16_t s_collected_material;
+static char s_message[192],s_radar_notice[64];
+static bool s_battery_ready,s_adv_active,s_hide_cooling=true;
+static int s_battery_level=-1;
+static lv_obj_t *s_radar_card_objects[RADAR_CARD_MAX];
+static lv_obj_t *s_radar_card_names[RADAR_CARD_MAX];
+static lv_obj_t *s_radar_point_objects[RADAR_POINT_MAX];
 
-static lv_obj_t *s_menu_scr;
-static lv_obj_t *s_cards[DEMO_COUNT];
-static lv_obj_t *s_rows[DEMO_COUNT];
-static lv_obj_t *s_mascot;
-static demo_navigation_t s_navigation;
-static QueueHandle_t s_input_queue;
-static TaskHandle_t s_input_task;
-static volatile bool s_input_ready;
+static bool radar_collectable(size_t index);
 
-static void menu_refresh(void) {
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        lv_label_set_text_fmt(s_rows[i], "%s%s",
-                              DEMOS[i].name,
-                              s_ok[i] ? "" : "  [FAIL]");
-        ui_pixel_set_selected(s_cards[i], i == s_navigation.selected, s_ok[i]);
-        lv_obj_set_style_text_color(s_rows[i],
-            s_ok[i] ? lv_color_hex(UI_INK) : lv_color_hex(0x7A2020), 0);
-    }
-}
+static uint32_t uptime_ms(void){return (uint32_t)(esp_timer_get_time()/1000);}
+static potion_clock_t clock_now(void){time_t now=time(NULL);return(potion_clock_t){.epoch=(int64_t)now,.uptime_sec=uptime_ms()/1000,.session_id=s_session_id,.epoch_valid=now>=1704067200};}
 
-static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create("FoloToy");
+static lv_obj_t *label_at(lv_obj_t*parent,const char*text,int x,int y,uint32_t color){lv_obj_t*l=lv_label_create(parent);lv_obj_set_style_text_font(l,&potion_font_16,0);lv_obj_set_style_text_color(l,lv_color_hex(color),0);lv_label_set_text(l,text);lv_obj_set_pos(l,x,y);return l;}
+static lv_obj_t *panel(lv_obj_t*parent,int x,int y,int w,int h,bool selected){lv_obj_t*o=lv_obj_create(parent);lv_obj_remove_style_all(o);lv_obj_set_pos(o,x,y);lv_obj_set_size(o,w,h);lv_obj_set_style_bg_color(o,lv_color_hex(selected?COLOR_PANEL_2:COLOR_PANEL),0);lv_obj_set_style_bg_opa(o,LV_OPA_COVER,0);lv_obj_set_style_border_width(o,selected?2:1,0);lv_obj_set_style_border_color(o,lv_color_hex(selected?COLOR_GOLD:COLOR_RING),0);lv_obj_set_style_radius(o,4,0);return o;}
+static void item_image(lv_obj_t*parent,const lv_image_dsc_t*image,int x,int y){lv_obj_t*o=lv_image_create(parent);lv_image_set_src(o,image);lv_obj_set_pos(o,x,y);}
+static void footer(lv_obj_t*screen,const char*text){lv_obj_t*l=label_at(screen,text,0,296,COLOR_MUTED);lv_obj_set_width(l,240);lv_obj_set_style_text_align(l,LV_TEXT_ALIGN_CENTER,0);}
+static lv_obj_t *screen_base(const char*title){lv_obj_t*s=lv_obj_create(NULL);lv_obj_remove_style_all(s);lv_obj_set_style_bg_color(s,lv_color_hex(COLOR_VOID),0);lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);lv_obj_t*b=panel(s,12,12,216,31,true);label_at(b,title,8,5,COLOR_INK);lv_obj_t*bat=label_at(b,"",164,5,COLOR_TEAL);if(s_battery_level>=0)lv_label_set_text_fmt(bat,"%d%%",s_battery_level);else lv_label_set_text(bat,"--%");return s;}
+static void progress_bar(lv_obj_t*parent,int x,int y,int w,uint8_t value){lv_obj_t*bg=panel(parent,x,y,w,7,false);lv_obj_set_style_border_width(bg,0,0);lv_obj_t*fill=lv_obj_create(bg);lv_obj_remove_style_all(fill);lv_obj_set_pos(fill,0,0);lv_obj_set_size(fill,(w*value)/100,7);lv_obj_set_style_bg_color(fill,lv_color_hex(value>=100?COLOR_TEAL:COLOR_GOLD),0);lv_obj_set_style_bg_opa(fill,LV_OPA_COVER,0);}
 
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        int x = 11 + (int)(i % 2) * 112;
-        int y = 52 + (int)(i / 2) * 47;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
-        s_rows[i] = lv_label_create(s_cards[i]);
-        lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_center(s_rows[i]);
-    }
+static int owned_material_at(unsigned selection){for(unsigned id=0,found=0;id<POTION_MATERIAL_COUNT;++id)if(s_player.materials[id]&&found++==selection)return(int)id;return-1;}
+static int owned_potion_at(unsigned selection){for(unsigned id=0,found=0;id<POTION_TYPE_COUNT;++id)if(s_player.potions[id]&&found++==selection)return(int)id;return-1;}
+static unsigned staged_count(uint16_t id){unsigned n=0;for(unsigned i=0;i<s_cauldron_count;++i)n+=s_cauldron[i]==id;return n;}
+static int available_material_at(unsigned selection){for(unsigned id=0,found=0;id<POTION_MATERIAL_COUNT;++id)if(s_player.materials[id]>staged_count(id)&&found++==selection)return(int)id;return-1;}
+static size_t available_material_types(void){size_t n=0;for(unsigned id=0;id<POTION_MATERIAL_COUNT;++id)n+=s_player.materials[id]>staged_count(id);return n;}
+static unsigned screen_timeout_index(void){return s_player.screen_timeout_index<SCREEN_TIMEOUT_COUNT?s_player.screen_timeout_index:1U;}
 
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 242);
+static void render_home(void){lv_obj_t*s=screen_base("口袋炼金术师");unsigned start=s_home_selected>3?s_home_selected-3:0;for(unsigned row=0;row<5&&start+row<6;++row){unsigned i=start+row;lv_obj_t*c=panel(s,18,52+(int)row*46,204,39,i==s_home_selected);label_at(c,i==s_home_selected?">":"·",9,8,COLOR_GOLD);label_at(c,HOME_NAMES[i],34,8,i==s_home_selected?COLOR_INK:COLOR_MUTED);item_image(c,&potion_navigation_images[i],158,-1);}footer(s,"上/下移动  确定进入");lv_screen_load(s);}
+static void render_scanning(void){lv_obj_t*s=screen_base(s_scan_mode==SCAN_EXPLORE?"建立探索基线":"搜索无线网");lv_obj_t*b=panel(s,25,80,190,160,true);label_at(b,s_scan_mode==SCAN_EXPLORE?"正在感知周围环境":"正在查找炼药房",20,34,COLOR_INK);label_at(b,s_scan_mode==SCAN_EXPLORE?"请移动到新的位置":"仅扫描无线网络",29,75,COLOR_TEAL);label_at(b,"长按可随时返回",30,112,COLOR_MUTED);footer(s,"长按确定取消");lv_screen_load(s);}
+static void radar_ring(lv_obj_t*s,int size){lv_obj_t*r=lv_obj_create(s);lv_obj_remove_style_all(r);lv_obj_set_size(r,size,size);lv_obj_set_pos(r,74-size/2,164-size/2);lv_obj_set_style_bg_opa(r,LV_OPA_TRANSP,0);lv_obj_set_style_border_width(r,1,0);lv_obj_set_style_border_color(r,lv_color_hex(COLOR_RING),0);lv_obj_set_style_radius(r,LV_RADIUS_CIRCLE,0);}
+static void radar_dot(lv_obj_t*parent,int x,int y,uint32_t color,bool selected){lv_obj_t*dot=lv_obj_create(parent);lv_obj_remove_style_all(dot);lv_obj_set_pos(dot,x-5,y-5);lv_obj_set_size(dot,10,10);lv_obj_set_style_bg_color(dot,lv_color_hex(color),0);lv_obj_set_style_bg_opa(dot,LV_OPA_COVER,0);lv_obj_set_style_border_width(dot,selected?2:1,0);lv_obj_set_style_border_color(dot,lv_color_hex(selected?COLOR_INK:COLOR_VOID),0);lv_obj_set_style_radius(dot,LV_RADIUS_CIRCLE,0);}
+static lv_obj_t *radar_map_dot(lv_obj_t*parent,int x,int y,uint32_t color,bool selected){lv_obj_t*dot=lv_obj_create(parent);lv_obj_remove_style_all(dot);lv_obj_set_pos(dot,x-2,y-2);lv_obj_set_size(dot,5,5);lv_obj_set_style_bg_color(dot,lv_color_hex(color),0);lv_obj_set_style_bg_opa(dot,LV_OPA_COVER,0);lv_obj_set_style_border_width(dot,selected?1:0,0);lv_obj_set_style_border_color(dot,lv_color_hex(COLOR_INK),0);lv_obj_set_style_radius(dot,LV_RADIUS_CIRCLE,0);return dot;}
+static void signal_icon(lv_obj_t*parent,int x,int y,unsigned level){for(unsigned i=0;i<3;++i){lv_obj_t*bar=lv_obj_create(parent);lv_obj_remove_style_all(bar);int height=5+(int)i*4;lv_obj_set_pos(bar,x+(int)i*5,y+13-height);lv_obj_set_size(bar,3,height);lv_obj_set_style_bg_color(bar,lv_color_hex(i<=level?COLOR_TEAL:COLOR_RING),0);lv_obj_set_style_bg_opa(bar,LV_OPA_COVER,0);lv_obj_set_style_radius(bar,1,0);}}
+static size_t radar_card_count(void){return s_radar_count<RADAR_CARD_MAX?s_radar_count:RADAR_CARD_MAX;}
+static void set_panel_selected(lv_obj_t*object,bool selected){lv_obj_set_style_bg_color(object,lv_color_hex(selected?COLOR_PANEL_2:COLOR_PANEL),0);lv_obj_set_style_border_width(object,selected?2:1,0);lv_obj_set_style_border_color(object,lv_color_hex(selected?COLOR_GOLD:COLOR_RING),0);}
+static void refresh_radar_selection(void){size_t cards=radar_card_count();uint64_t selected_fp=cards&&s_selected<cards?s_radar[s_selected].fingerprint:0;for(size_t i=0;i<cards;++i){bool selected=i==s_selected;if(s_radar_card_objects[i])set_panel_selected(s_radar_card_objects[i],selected);if(s_radar_card_names[i])lv_obj_set_style_text_color(s_radar_card_names[i],lv_color_hex(selected?COLOR_INK:COLOR_MUTED),0);}for(size_t i=0;i<s_radar_point_count;++i)if(s_radar_point_objects[i])lv_obj_set_style_border_width(s_radar_point_objects[i],s_radar_points[i].fingerprint==selected_fp?1:0,0);}
+static void format_cooldown_detail(int64_t seconds,char*out,size_t cap){uint64_t remaining=seconds>0?(uint64_t)seconds:0;if(remaining>=86400){uint64_t days=remaining/86400,hours=(remaining%86400)/3600;if(hours)snprintf(out,cap,"%llu天%llu时",(unsigned long long)days,(unsigned long long)hours);else snprintf(out,cap,"%llu天",(unsigned long long)days);}else if(remaining>=3600){uint64_t hours=remaining/3600,minutes=(remaining%3600)/60;if(minutes)snprintf(out,cap,"%llu时%llu分",(unsigned long long)hours,(unsigned long long)minutes);else snprintf(out,cap,"%llu时",(unsigned long long)hours);}else if(remaining>=60){snprintf(out,cap,"%llu分%llu秒",(unsigned long long)(remaining/60),(unsigned long long)(remaining%60));}else snprintf(out,cap,"%llu秒",(unsigned long long)remaining);}
+static void radar_status_text(size_t i,char*out,size_t cap){if(s_radar[i].cooldown_remaining>0){potion_duration_unit_t unit;uint32_t value=potion_duration_ceil(s_radar[i].cooldown_remaining,&unit);snprintf(out,cap,"冷却%lu%s",(unsigned long)value,DURATION_UNITS[unit]);}else if(radar_collectable(i))snprintf(out,cap,"可以采集");else snprintf(out,cap,"%s",potion_signal_strength_percent(s_radar[i].source,s_radar[i].rssi)>=s_signal_threshold?"继续移动":"继续靠近");}
+static void render_radar(void){memset(s_radar_card_objects,0,sizeof(s_radar_card_objects));memset(s_radar_card_names,0,sizeof(s_radar_card_names));memset(s_radar_point_objects,0,sizeof(s_radar_point_objects));lv_obj_t*s=screen_base("材料雷达");lv_obj_t*filter=panel(s,12,49,112,25,s_hide_cooling);label_at(filter,s_hide_cooling?"长按上：冷却":"长按上：仅采",5,3,s_hide_cooling?COLOR_TEAL:COLOR_MUTED);radar_ring(s,116);radar_ring(s,78);radar_ring(s,40);potion_radar_point_t points[RADAR_POINT_MAX];potion_radar_layout(s_radar_points,s_radar_point_count,points);size_t cards=radar_card_count();uint64_t selected_fp=cards&&s_selected<cards?s_radar[s_selected].fingerprint:0;for(size_t i=0;i<s_radar_point_count;++i)s_radar_point_objects[i]=radar_map_dot(s,74+points[i].x,164+points[i].y,MATERIAL_COLORS[s_radar_points[i].material_id],s_radar_points[i].fingerprint==selected_fp);radar_map_dot(s,74,164,COLOR_INK,false);label_at(s,"信号雷达",42,220,COLOR_MUTED);if(!s_radar_point_count)label_at(s,"暂未发现材料",113,142,COLOR_MUTED);else if(!cards){label_at(s,"暂无可采集材料",120,142,COLOR_MUTED);label_at(s,"请去周围探索",128,168,COLOR_TEAL);}for(size_t i=0;i<cards;++i){const potion_material_def_t*d=potion_material_def(s_radar[i].material_id);lv_obj_t*c=panel(s,119,59+(int)i*68,109,59,i==s_selected);s_radar_card_objects[i]=c;radar_dot(c,12,13,MATERIAL_COLORS[d->id],i==s_selected);s_radar_card_names[i]=label_at(c,d->name,21,5,i==s_selected?COLOR_INK:COLOR_MUTED);label_at(c,RARITY_NAMES[d->rarity],69,5,COLOR_GOLD);char status[32];radar_status_text(i,status,sizeof(status));label_at(c,status,7,25,radar_collectable(i)?COLOR_TEAL:COLOR_MUTED);if(s_radar[i].cooldown_remaining!=0)item_image(c,&potion_radar_status_images[1],82,24);else if(radar_collectable(i))item_image(c,&potion_radar_status_images[0],82,24);else{uint8_t strength=potion_signal_strength_percent(s_radar[i].source,s_radar[i].rssi);signal_icon(c,84,29,strength>=s_signal_threshold?2:strength>=s_signal_threshold/2?1:0);}progress_bar(c,7,48,94,s_progress_value[i]);}if(s_radar_notice[0])label_at(s,s_radar_notice,12,264,COLOR_TEAL);footer(s,"上/下选择  确定采集");lv_screen_load(s);}
+static void render_inventory(void){lv_obj_t*s=screen_base("材料仓库");size_t count=potion_owned_material_types(&s_player);if(!count)label_at(s,"还没有材料",72,145,COLOR_MUTED);unsigned start=s_selected>4?s_selected-4:0;for(unsigned row=0;row<5&&start+row<count;++row){int id=owned_material_at(start+row);const potion_material_def_t*d=potion_material_def(id);lv_obj_t*c=panel(s,14,52+(int)row*46,212,40,start+row==s_selected);item_image(c,&potion_material_images[id],4,4);label_at(c,d->name,43,4,start+row==s_selected?COLOR_INK:COLOR_MUTED);label_at(c,RARITY_NAMES[d->rarity],43,21,COLOR_GOLD);lv_obj_t*n=label_at(c,"",166,11,COLOR_TEAL);lv_label_set_text_fmt(n,"x%u",s_player.materials[id]);}footer(s,"确定看属性  长按返回");lv_screen_load(s);}
+static void render_collection_reward(void){uint16_t id=s_collected_material;const potion_material_def_t*d=potion_material_def(id);lv_obj_t*s=screen_base("采集成功");lv_obj_t*b=panel(s,24,59,192,219,true);item_image(b,&potion_material_images[id],80,10);lv_obj_t*n=label_at(b,d->name,0,52,COLOR_INK);lv_obj_set_width(n,192);lv_obj_set_style_text_align(n,LV_TEXT_ALIGN_CENTER,0);lv_obj_t*summary=label_at(b,"",0,78,COLOR_GOLD);lv_obj_set_width(summary,192);lv_obj_set_style_text_align(summary,LV_TEXT_ALIGN_CENTER,0);lv_label_set_text_fmt(summary,"获得1份  %s",RARITY_NAMES[d->rarity]);lv_obj_t*desc=label_at(b,d->description,16,108,COLOR_MUTED);lv_obj_set_width(desc,160);lv_label_set_long_mode(desc,LV_LABEL_LONG_WRAP);lv_obj_t*owned=label_at(b,"",0,169,COLOR_TEAL);lv_obj_set_width(owned,192);lv_obj_set_style_text_align(owned,LV_TEXT_ALIGN_CENTER,0);lv_label_set_text_fmt(owned,"已收入仓库  现有%u份",s_player.materials[id]);footer(s,"确定看属性  长按继续");lv_screen_load(s);}
+static void render_material_detail(void){uint16_t id=s_material_detail_id;const potion_material_def_t*d=potion_material_def(id);lv_obj_t*s=screen_base("材料属性");lv_obj_t*b=panel(s,18,60,204,218,true);item_image(b,&potion_material_images[id],82,8);lv_obj_t*n=label_at(b,d->name,0,45,COLOR_INK);lv_obj_set_width(n,204);lv_obj_set_style_text_align(n,LV_TEXT_ALIGN_CENTER,0);lv_obj_t*summary=label_at(b,"",0,69,COLOR_GOLD);lv_obj_set_width(summary,204);lv_obj_set_style_text_align(summary,LV_TEXT_ALIGN_CENTER,0);lv_label_set_text_fmt(summary,"%s  持有%u",RARITY_NAMES[d->rarity],s_player.materials[id]);label_at(b,d->description,15,93,COLOR_MUTED);for(unsigned a=0;a<8;++a){int x=8+(a%2)*98,y=117+(a/2)*23;item_image(b,&potion_property_images[a],x,y);lv_obj_t*l=label_at(b,"",x+26,y+3,d->properties[a]?COLOR_TEAL:COLOR_MUTED);lv_label_set_text_fmt(l,"%s%u",ATTR_NAMES[a],d->properties[a]);}const char*back=s_material_detail_return==PAGE_CAULDRON?"长按确定返回炼药":s_material_detail_return==PAGE_COLLECTION_REWARD?"长按确定返回收获":"长按确定返回仓库";footer(s,back);lv_screen_load(s);}
+static void draw_cauldron(lv_obj_t*s){for(unsigned i=0;i<4;++i){lv_obj_t*slot=panel(s,27+(int)i*49,55,42,36,i==s_cauldron_count);if(i<s_cauldron_count)item_image(slot,&potion_material_images[s_cauldron[i]],5,2);else label_at(slot,"+",14,7,COLOR_MUTED);}item_image(s,&potion_brewing_images[s_cauldron_count?1:0],72,84);}
+static void render_cauldron(void){lv_obj_t*s=screen_base("炼制药剂");draw_cauldron(s);size_t materials=available_material_types(),options=materials+3;if(s_selected>=options)s_selected=options?options-1:0;for(unsigned row=0;row<4&&row<options;++row){unsigned idx=(s_selected>2?s_selected-2:0)+row;if(idx>=options)break;lv_obj_t*c=panel(s,16,168+(int)row*29,208,25,idx==s_selected);if(idx<materials){int id=available_material_at(idx);const potion_material_def_t*d=potion_material_def(id);label_at(c,d->name,8,3,idx==s_selected?COLOR_INK:COLOR_MUTED);lv_obj_t*n=label_at(c,"",162,3,COLOR_TEAL);lv_label_set_text_fmt(n,"可用%u",s_player.materials[id]-staged_count(id));}else{const char*actions[]={"撤回一个","清空大锅","开始炼制"};label_at(c,actions[idx-materials],8,3,idx==s_selected?COLOR_GOLD:COLOR_MUTED);}}footer(s,"确定操作  长按上看属性");lv_screen_load(s);}
+static void render_brew_result(void){const potion_def_t*d=potion_def(s_result_potion);lv_obj_t*s=screen_base("炼制完成");lv_obj_t*b=panel(s,30,68,180,198,true);if(s_result_potion==POTION_MUDDY_ID)item_image(b,&potion_muddy_images[s_player.potion_seed[s_result_potion]%3],66,13);else item_image(b,&potion_bottle_images[s_result_potion],70,17);lv_obj_t*n=label_at(b,d->name,0,67,COLOR_INK);lv_obj_set_width(n,180);lv_obj_set_style_text_align(n,LV_TEXT_ALIGN_CENTER,0);label_at(b,s_result_potion==POTION_MUDDY_ID?"配方未命中正式药剂":"新配方已写入手册",18,103,s_result_potion==POTION_MUDDY_ID?COLOR_BAD:COLOR_TEAL);label_at(b,d->description,18,133,COLOR_MUTED);footer(s,"确定去展示  长按返回");lv_screen_load(s);}
+static void render_recipe_potions(void){lv_obj_t*s=screen_base("配方手册");size_t count=potion_owned_potion_types(&s_player);if(!count)label_at(s,"还没有成功记录",51,145,COLOR_MUTED);unsigned start=s_selected>4?s_selected-4:0;for(unsigned row=0;row<5&&start+row<count;++row){int id=owned_potion_at(start+row);const potion_def_t*d=potion_def(id);lv_obj_t*c=panel(s,14,52+(int)row*46,212,40,start+row==s_selected);label_at(c,d->name,9,4,start+row==s_selected?COLOR_INK:COLOR_MUTED);lv_obj_t*l=label_at(c,"",9,21,COLOR_TEAL);lv_label_set_text_fmt(l,"持有%u  配方%u",s_player.potions[id],(unsigned)potion_recipe_history_count(&s_player,id));}footer(s,"确定查看  长按返回");lv_screen_load(s);}
+static void format_recipe(char*out,size_t cap,const potion_recipe_history_t*h){out[0]='\0';for(unsigned i=0;i<4;){unsigned j=i+1;while(j<4&&h->material_id[j]==h->material_id[i])++j;const potion_material_def_t*d=potion_material_def(h->material_id[i]);size_t used=strlen(out);snprintf(out+used,cap-used,"%s%sx%u",used?" ":"",d?d->name:"?",j-i);i=j;}}
+static void render_recipe_history(void){const potion_def_t*d=potion_def(s_recipe_potion);lv_obj_t*s=screen_base(d->name);size_t count=potion_recipe_history_count(&s_player,s_recipe_potion);unsigned start=s_selected>3?s_selected-3:0;for(unsigned row=0;row<4&&start+row<count;++row){const potion_recipe_history_t*h=potion_recipe_history_at(&s_player,s_recipe_potion,start+row);char text[96];format_recipe(text,sizeof(text),h);lv_obj_t*c=panel(s,13,57+(int)row*57,214,49,start+row==s_selected);lv_obj_t*l=label_at(c,text,8,6,start+row==s_selected?COLOR_INK:COLOR_MUTED);lv_obj_set_width(l,198);lv_label_set_long_mode(l,LV_LABEL_LONG_WRAP);}footer(s,"上/下查看  长按返回");lv_screen_load(s);}
+static void render_showcase(void){lv_obj_t*s=screen_base("药剂展示");size_t count=potion_owned_potion_types(&s_player);if(!count){label_at(s,"还没有药剂",72,138,COLOR_MUTED);label_at(s,"请先完成一次炼制",48,168,COLOR_GOLD);}else{int id=owned_potion_at(s_selected);const potion_def_t*d=potion_def(id);lv_obj_t*b=panel(s,30,69,180,186,true);if(id==POTION_MUDDY_ID)item_image(b,&potion_muddy_images[s_player.potion_seed[id]%3],66,14);else item_image(b,&potion_bottle_images[id],70,18);lv_obj_t*n=label_at(b,d->name,0,70,COLOR_INK);lv_obj_set_width(n,180);lv_obj_set_style_text_align(n,LV_TEXT_ALIGN_CENTER,0);lv_obj_t*c=label_at(b,"",0,103,COLOR_GOLD);lv_obj_set_width(c,180);lv_obj_set_style_text_align(c,LV_TEXT_ALIGN_CENTER,0);lv_label_set_text_fmt(c,"持有 %u 瓶",s_player.potions[id]);lv_obj_t*st=label_at(b,s_adv_active?"正在近距离展示":"确定键开启展示",0,142,s_adv_active?COLOR_TEAL:COLOR_MUTED);lv_obj_set_width(st,180);lv_obj_set_style_text_align(st,LV_TEXT_ALIGN_CENTER,0);}footer(s,"上/下选择  确定切换");lv_screen_load(s);}
+static void render_settings(void){lv_obj_t*s=screen_base("设置");const char*names[]={"登记当前炼药房","自动息屏","立即息屏","玩家统计"};static const int y[]={50,92,170,212};static const int h[]={38,74,38,38};for(unsigned i=0;i<4;++i){lv_obj_t*c=panel(s,14,y[i],212,h[i],i==s_selected);label_at(c,names[i],9,7,i==s_selected?COLOR_INK:COLOR_MUTED);if(i==1){lv_obj_t*v=label_at(c,SCREEN_TIMEOUT_NAMES[screen_timeout_index()],137,7,COLOR_TEAL);lv_obj_set_width(v,66);lv_obj_set_style_text_align(v,LV_TEXT_ALIGN_RIGHT,0);label_at(c,"会自动关机",9,29,COLOR_GOLD);label_at(c,"长按电源键开启",9,49,COLOR_MUTED);}}lv_obj_t*info=label_at(s,"",18,255,COLOR_TEAL);lv_label_set_text_fmt(info,"炼药房：%s  材料%u种  药剂%u种",s_player.lab_set?"已登记":"未设置",(unsigned)potion_owned_material_types(&s_player),(unsigned)potion_owned_potion_types(&s_player));lv_obj_t*version=label_at(s,"版本 " APP_VERSION,0,275,COLOR_MUTED);lv_obj_set_width(version,240);lv_obj_set_style_text_align(version,LV_TEXT_ALIGN_CENTER,0);footer(s,"确定选择  长按返回");lv_screen_load(s);}
+static void render_lab_list(void){lv_obj_t*s=screen_base("选择炼药房");size_t visible=0;for(size_t i=0;i<s_last_scan.count;++i)visible+=s_last_scan.signals[i].source==POTION_SOURCE_WIFI&&s_last_scan.signals[i].ssid[0];if(!visible)label_at(s,"没有发现可用无线网",39,145,COLOR_MUTED);unsigned start=s_selected>4?s_selected-4:0,logical=0,shown=0;for(size_t i=0;i<s_last_scan.count&&shown<5;++i){potion_signal_t*sig=&s_last_scan.signals[i];if(sig->source!=POTION_SOURCE_WIFI||!sig->ssid[0])continue;if(logical++<start)continue;unsigned index=start+shown;lv_obj_t*c=panel(s,14,52+(int)shown*46,212,40,index==s_selected);lv_obj_t*n=label_at(c,sig->ssid,8,4,index==s_selected?COLOR_INK:COLOR_MUTED);lv_obj_set_width(n,153);lv_label_set_long_mode(n,LV_LABEL_LONG_DOT);lv_obj_t*r=label_at(c,"",169,11,sig->rssi>=-72?COLOR_TEAL:COLOR_BAD);lv_label_set_text_fmt(r,"%d",sig->rssi);shown++;}footer(s,"显示实际名称  确定登记");lv_screen_load(s);}
+static void render_message(void){lv_obj_t*s=screen_base("炼金笔记");lv_obj_t*b=panel(s,22,82,196,151,true);lv_obj_t*t=label_at(b,s_message,12,24,COLOR_INK);lv_obj_set_width(t,172);lv_label_set_long_mode(t,LV_LABEL_LONG_WRAP);footer(s,"确定继续");lv_screen_load(s);}
+static void render(void){lv_obj_t*old=lv_screen_active();if(old)lv_obj_clean(old);switch(s_page){case PAGE_HOME:render_home();break;case PAGE_SCANNING:render_scanning();break;case PAGE_RADAR:render_radar();break;case PAGE_COLLECTION_REWARD:render_collection_reward();break;case PAGE_INVENTORY:render_inventory();break;case PAGE_MATERIAL_DETAIL:render_material_detail();break;case PAGE_CAULDRON:render_cauldron();break;case PAGE_BREW_RESULT:render_brew_result();break;case PAGE_RECIPE_POTIONS:render_recipe_potions();break;case PAGE_RECIPE_HISTORY:render_recipe_history();break;case PAGE_SHOWCASE:render_showcase();break;case PAGE_SETTINGS:render_settings();break;case PAGE_LAB_LIST:render_lab_list();break;default:render_message();break;}if(old&&old!=lv_screen_active())lv_obj_delete(old);}
 
-    menu_refresh();
-    lv_screen_load(s_menu_scr);
-}
+static void set_message_to(const char*text,page_t back){snprintf(s_message,sizeof(s_message),"%s",text);s_message_return=back;s_page=PAGE_MESSAGE;}
+static void go_home(void){potion_radio_cancel();potion_radio_showcase_stop();s_radio_resume=RADIO_RESUME_NONE;s_adv_active=false;++s_request_id;s_page=PAGE_HOME;s_selected=0;s_cauldron_count=0;}
+static bool start_radio_scan(scan_mode_t mode,bool show_page){s_scan_mode=mode;if(show_page){s_page=PAGE_SCANNING;s_selected=0;}++s_request_id;bool wifi_only=mode!=SCAN_EXPLORE;if(!potion_radio_scan_start(s_request_id,wifi_only)){set_message_to("无线模块正忙\n请稍后重试",PAGE_HOME);return false;}s_radio_resume=RADIO_RESUME_NONE;return true;}
+static void begin_explore(void){memset(s_explore_tracks,0,sizeof(s_explore_tracks));memset(s_progress,0,sizeof(s_progress));memset(s_progress_value,0,sizeof(s_progress_value));memset(s_virtual_resources,0,sizeof(s_virtual_resources));s_explore_scan_generation=0;s_scan_signal_count=0;s_radar_count=0;s_radar_point_count=0;s_hide_cooling=true;s_explore_started_ms=uptime_ms();s_threshold_wait_started_ms=s_explore_started_ms;s_last_real_signal_ms=s_explore_started_ms;s_signal_threshold=SIGNAL_THRESHOLD_DEFAULT;s_virtual_active=false;s_radar_notice[0]='\0';start_radio_scan(SCAN_EXPLORE,true);}
+static int lab_signal_at(unsigned selection){for(size_t i=0,found=0;i<s_last_scan.count;++i)if(s_last_scan.signals[i].source==POTION_SOURCE_WIFI&&s_last_scan.signals[i].ssid[0]&&found++==selection)return(int)i;return-1;}
+static explore_track_t *explore_track_for(uint64_t fp,bool create){explore_track_t*slot=NULL;for(size_t i=0;i<POTION_SCAN_MAX;++i){explore_track_t*track=&s_explore_tracks[i];if(track->progress.initialized&&track->progress.fingerprint==fp)return track;if(!track->progress.initialized&&!slot)slot=track;}if(!create)return NULL;if(!slot){slot=&s_explore_tracks[0];for(size_t i=1;i<POTION_SCAN_MAX;++i)if(s_explore_tracks[i].last_seen_scan<slot->last_seen_scan)slot=&s_explore_tracks[i];}memset(slot,0,sizeof(*slot));return slot;}
+static void sample_explore_track(explore_track_t*track,const potion_material_signal_t*signal,uint32_t elapsed){uint8_t strength=potion_signal_strength_percent(signal->source,signal->rssi);(void)potion_explore_update(&track->progress,signal->fingerprint,strength,signal->rssi,elapsed);track->last_seen_scan=s_explore_scan_generation;}
+static int virtual_resource_index(uint64_t fingerprint){if(!s_virtual_active)return-1;for(unsigned i=0;i<VIRTUAL_RESOURCE_COUNT;++i)if(s_virtual_resources[i].fingerprint==fingerprint)return(int)i;return-1;}
+static bool virtual_resource_unlocked(uint64_t fingerprint,uint32_t now_ms){int index=virtual_resource_index(fingerprint);return index>=0&&now_ms-s_virtual_started_ms>=s_virtual_resources[index].unlock_delay_ms;}
+static void begin_virtual_resources(uint32_t now_ms){uint64_t seed=((uint64_t)esp_random()<<32)|esp_random();if(!seed)seed=1;s_virtual_started_ms=now_ms;s_virtual_active=true;uint32_t delays[VIRTUAL_RESOURCE_COUNT];delays[0]=8000U+esp_random()%5001U;delays[1]=25000U+esp_random()%10001U;delays[2]=52000U+esp_random()%16001U;for(unsigned i=3;i<VIRTUAL_RESOURCE_COUNT;++i)delays[i]=delays[i-1]+25000U+esp_random()%10001U;for(unsigned i=0;i<VIRTUAL_RESOURCE_COUNT;++i){uint64_t fp=0xf000000000000000ULL|((seed+(uint64_t)(i+1)*0x9e3779b97f4a7c15ULL)&0x0fffffffffffffffULL);if(!fp)fp=i+1;s_virtual_resources[i]=(virtual_resource_t){fp,delays[i],(uint8_t)(12U+esp_random()%39U)};}}
+static int8_t virtual_rssi(uint8_t strength){return(int8_t)(-100+(unsigned)strength*45U/100U);}
+static size_t append_virtual_signals(size_t offset,uint32_t now_ms){if(!s_virtual_active)return offset;uint32_t elapsed=now_ms-s_virtual_started_ms;for(unsigned i=0;i<VIRTUAL_RESOURCE_COUNT&&offset<POTION_SCAN_MAX;++i){virtual_resource_t*v=&s_virtual_resources[i];if(!v->fingerprint)continue;bool unlocked=elapsed>=v->unlock_delay_ms;uint8_t strength=v->locked_strength;if(unlocked){unsigned promoted=s_signal_threshold+8U+((elapsed/1000U+i*7U)%9U);strength=(uint8_t)(promoted>100U?100U:promoted);}s_scan_signals[offset++]=(potion_material_signal_t){v->fingerprint,virtual_rssi(strength),potion_material_for_signal(POTION_SOURCE_BLE_STABLE,v->fingerprint),POTION_SOURCE_BLE_STABLE};}return offset;}
+static void update_signal_threshold(size_t count,uint32_t now_ms){if(!count)return;uint8_t strongest=0;for(size_t i=0;i<count;++i){uint8_t strength=potion_signal_strength_percent(s_scan_signals[i].source,s_scan_signals[i].rssi);if(strength>strongest)strongest=strength;}if(strongest>=s_signal_threshold){s_threshold_wait_started_ms=now_ms;return;}if(now_ms-s_threshold_wait_started_ms<SIGNAL_RELAX_MS)return;uint8_t previous=s_signal_threshold;s_signal_threshold=potion_signal_threshold_relax(s_signal_threshold,strongest);s_threshold_wait_started_ms=now_ms;if(s_signal_threshold<previous)snprintf(s_radar_notice,sizeof(s_radar_notice),"感知适应  距离要求降低");}
+static void remove_virtual_resource(uint64_t fingerprint){int index=virtual_resource_index(fingerprint);if(index<0)return;s_virtual_resources[index].fingerprint=0;bool any=false;for(unsigned i=0;i<VIRTUAL_RESOURCE_COUNT;++i)any|=s_virtual_resources[i].fingerprint!=0;if(!any)s_virtual_active=false;}
+static void prune_virtual_resources(size_t real_count){if(!s_virtual_active||real_count<RADAR_POINT_MAX)return;for(unsigned i=0;i<VIRTUAL_RESOURCE_COUNT;++i){uint64_t fp=s_virtual_resources[i].fingerprint;if(!fp)continue;bool visible=false;for(size_t j=0;j<s_radar_point_count;++j)if(s_radar_points[j].fingerprint==fp){visible=true;break;}if(!visible)remove_virtual_resource(fp);}}
+static bool radar_collectable(size_t index){if(index>=s_radar_count||s_radar[index].cooldown_remaining!=0)return false;if(virtual_resource_unlocked(s_radar[index].fingerprint,uptime_ms()))return true;return potion_explore_collectable_at(&s_progress[index],s_signal_threshold);}
+static bool save_candidate(potion_player_t*candidate){potion_clock_t clock=clock_now();(void)potion_cooldown_checkpoint(candidate,&clock);return potion_store_request_save(candidate);}
+static void checkpoint_cooldowns(const potion_clock_t*clock){uint32_t now_ms=uptime_ms();if(now_ms-s_last_cooldown_checkpoint_ms<COOLDOWN_CHECKPOINT_MS)return;s_last_cooldown_checkpoint_ms=now_ms;s_candidate=s_player;if(!potion_cooldown_checkpoint(&s_candidate,clock))return;s_candidate.generation++;if(potion_store_request_save(&s_candidate))s_player=s_candidate;else ESP_LOGW(TAG,"cooldown checkpoint was not saved");}
+static void shutdown_warning(const char*step,esp_err_t err){if(err!=ESP_OK)ESP_LOGW(TAG,"auto shutdown: %s failed: %s",step,esp_err_to_name(err));}
+static bool auto_shutdown_ready(const potion_clock_t*clock,uint32_t now_ms){if(!s_idle.screen_off||s_shutdown_started||(uint32_t)(now_ms-s_screen_off_started_ms)<AUTO_SHUTDOWN_GRACE_MS)return false;if(potion_cooldown_any_active(&s_player,clock)||potion_radio_busy()||s_adv_active)return false;if((s_queue&&uxQueueMessagesWaiting(s_queue))||(s_radio_queue&&uxQueueMessagesWaiting(s_radio_queue)))return false;return true;}
+static void terminal_shutdown(const potion_clock_t*clock){s_shutdown_started=true;s_radio_resume=RADIO_RESUME_NONE;++s_request_id;potion_radio_cancel();potion_radio_showcase_stop();s_candidate=s_player;if(potion_cooldown_checkpoint(&s_candidate,clock)){s_candidate.generation++;if(potion_store_request_save(&s_candidate))s_player=s_candidate;else ESP_LOGW(TAG,"final cooldown checkpoint was not saved");}if(s_battery_ready)shutdown_warning("battery sleep",bsp_battery_sleep());shutdown_warning("audio sleep",bsp_audio_sleep());shutdown_warning("audio pin release",bsp_audio_prepare_deep_sleep());shutdown_warning("I2C pin release",bsp_i2c_prepare_deep_sleep());if(!bsp_lvgl_lock(1000)){ESP_LOGE(TAG,"auto shutdown could not stop LVGL; restarting");esp_restart();}shutdown_warning("display sleep",bsp_display_prepare_deep_sleep());shutdown_warning("disable wake sources",esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));ESP_LOGI(TAG,"all cooldowns complete; entering terminal deep sleep");esp_deep_sleep_start();ESP_LOGE(TAG,"deep sleep unexpectedly returned; restarting");esp_restart();}
+static void screen_off(void){s_idle.screen_off=true;s_screen_off_started_ms=uptime_ms();s_shutdown_started=false;potion_clock_t clock=clock_now();checkpoint_cooldowns(&clock);if(s_page==PAGE_SCANNING||s_page==PAGE_RADAR)s_radio_resume=RADIO_RESUME_SCAN;else if(s_page==PAGE_SHOWCASE&&(s_adv_active||potion_radio_busy()))s_radio_resume=RADIO_RESUME_SHOWCASE;else s_radio_resume=RADIO_RESUME_NONE;++s_request_id;potion_radio_cancel();potion_radio_showcase_stop();s_adv_active=false;bsp_display_backlight(0);}
+static void screen_wake(void){s_shutdown_started=false;if(bsp_lvgl_lock(500)){render();bsp_lvgl_unlock();}bsp_display_backlight(SCREEN_BACKLIGHT);}
+static void resume_screen_services(void){if(s_radio_resume==RADIO_RESUME_NONE||potion_radio_busy())return;if(s_radio_resume==RADIO_RESUME_SCAN){if(s_page!=PAGE_SCANNING&&s_page!=PAGE_RADAR){s_radio_resume=RADIO_RESUME_NONE;return;}++s_request_id;bool wifi_only=s_scan_mode!=SCAN_EXPLORE;if(potion_radio_scan_start(s_request_id,wifi_only))s_radio_resume=RADIO_RESUME_NONE;return;}if(s_page!=PAGE_SHOWCASE){s_radio_resume=RADIO_RESUME_NONE;return;}int id=owned_potion_at(s_selected);s_radio_resume=RADIO_RESUME_NONE;if(id>=0&&!potion_radio_showcase_start((uint16_t)id,s_player.potion_seed[id])){set_message_to("无线模块启动失败\n请重新开启展示",PAGE_SHOWCASE);if(bsp_lvgl_lock(500)){render();bsp_lvgl_unlock();}}}
 
-static void enter_menu(void) {
-    menu_build();
-}
+static void rebuild_radar_cards(const potion_clock_t*clock){uint64_t selected_fp=s_selected<radar_card_count()?s_radar[s_selected].fingerprint:0;potion_radar_item_t next[RADAR_CARD_MAX];size_t count=potion_radar_aggregate(&s_player,s_scan_signals,s_scan_signal_count,clock,next,RADAR_CARD_MAX,s_hide_cooling);memset(s_progress,0,sizeof(s_progress));memset(s_progress_value,0,sizeof(s_progress_value));for(size_t i=0;i<count;++i){explore_track_t*track=explore_track_for(next[i].fingerprint,false);if(track){s_progress[i]=track->progress;s_progress_value[i]=potion_explore_score_at(&track->progress,s_signal_threshold);}if(virtual_resource_unlocked(next[i].fingerprint,uptime_ms())&&next[i].cooldown_remaining==0)s_progress_value[i]=100;if(next[i].cooldown_remaining!=0)s_progress_value[i]=0;}memcpy(s_radar,next,count*sizeof(next[0]));s_radar_count=count;size_t cards=radar_card_count();bool restored=false;for(size_t i=0;selected_fp&&i<cards;++i)if(s_radar[i].fingerprint==selected_fp){s_selected=(unsigned)i;restored=true;break;}if(!restored&&s_selected>=cards)s_selected=cards?(unsigned)cards-1:0;}
+static void continue_explore(void){potion_clock_t clock=clock_now();rebuild_radar_cards(&clock);s_page=PAGE_RADAR;s_scan_mode=SCAN_EXPLORE;s_radio_resume=RADIO_RESUME_SCAN;}
+static void update_radar(const potion_radio_event_t*event){uint32_t now=uptime_ms();size_t real_count=event->count>POTION_SCAN_MAX?POTION_SCAN_MAX:event->count;s_scan_signal_count=real_count;for(size_t i=0;i<real_count;++i)s_scan_signals[i]=(potion_material_signal_t){event->signals[i].fingerprint,event->signals[i].rssi,potion_material_for_signal(event->signals[i].source,event->signals[i].fingerprint),event->signals[i].source};if(real_count){s_last_real_signal_ms=now;update_signal_threshold(real_count,now);}else if(!s_virtual_active&&now-s_last_real_signal_ms>=NO_SIGNAL_FALLBACK_MS)begin_virtual_resources(now);s_scan_signal_count=append_virtual_signals(real_count,now);potion_clock_t clock=clock_now();checkpoint_cooldowns(&clock);uint32_t elapsed=now-s_explore_started_ms;++s_explore_scan_generation;if(!s_explore_scan_generation)++s_explore_scan_generation;for(size_t i=0;i<s_scan_signal_count;++i){explore_track_t*track=explore_track_for(s_scan_signals[i].fingerprint,false);if(track)sample_explore_track(track,&s_scan_signals[i],elapsed);}for(size_t i=0;i<s_scan_signal_count;++i){explore_track_t*track=explore_track_for(s_scan_signals[i].fingerprint,false);if(!track){track=explore_track_for(s_scan_signals[i].fingerprint,true);sample_explore_track(track,&s_scan_signals[i],elapsed);}}s_radar_point_count=potion_radar_select(&s_player,s_scan_signals,s_scan_signal_count,&clock,s_radar_points,RADAR_POINT_MAX);prune_virtual_resources(real_count);rebuild_radar_cards(&clock);s_page=PAGE_RADAR;}
+static void collect_selected(void){if(s_selected>=s_radar_count)return;potion_radar_item_t*item=&s_radar[s_selected];if(item->cooldown_remaining!=0){char duration[32];format_cooldown_detail(item->cooldown_remaining,duration,sizeof(duration));snprintf(s_radar_notice,sizeof(s_radar_notice),"冷却%s",duration);return;}if(!radar_collectable(s_selected)){snprintf(s_radar_notice,sizeof(s_radar_notice),"继续移动并靠近材料");return;}uint8_t collected_strength=potion_signal_strength_percent(item->source,item->rssi);s_candidate=s_player;potion_clock_t clock=clock_now();int64_t remaining=0;if(!potion_collect(&s_candidate,item->source,item->fingerprint,item->material_id,&clock,&remaining)){snprintf(s_radar_notice,sizeof(s_radar_notice),"暂时无法采集");return;}if(!save_candidate(&s_candidate)){snprintf(s_radar_notice,sizeof(s_radar_notice),"保存失败，材料未扣取");return;}s_player=s_candidate;s_signal_threshold=potion_signal_threshold_recover(s_signal_threshold,collected_strength);s_threshold_wait_started_ms=uptime_ms();remove_virtual_resource(item->fingerprint);s_collected_material=item->material_id;explore_track_t*track=explore_track_for(item->fingerprint,false);if(track)memset(track,0,sizeof(*track));potion_explore_reset(&s_progress[s_selected]);item->cooldown_remaining=potion_material_def(item->material_id)->cooldown_sec;s_radar_notice[0]='\0';++s_request_id;potion_radio_cancel();s_radio_resume=RADIO_RESUME_NONE;s_page=PAGE_COLLECTION_REWARD;}
 
-static demo_nav_input_t navigation_input(bsp_btn_t btn, bsp_btn_ev_t event) {
-    if (event == BSP_BTN_LONG && btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_LONG;
-    if (event != BSP_BTN_CLICK) return DEMO_NAV_INPUT_OTHER;
-    if (btn == BSP_BTN_UP) return DEMO_NAV_INPUT_UP_CLICK;
-    if (btn == BSP_BTN_DOWN) return DEMO_NAV_INPUT_DOWN_CLICK;
-    if (btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_CLICK;
-    return DEMO_NAV_INPUT_OTHER;
-}
+static void process_radio(const potion_radio_event_t*event){if(s_idle.screen_off){if(event->type==POTION_RADIO_SHOWCASE_STARTED){s_radio_resume=RADIO_RESUME_SHOWCASE;potion_radio_showcase_stop();}if(event->type==POTION_RADIO_SHOWCASE_STOPPED||event->type==POTION_RADIO_SHOWCASE_FAILED)s_adv_active=false;return;}if(event->type==POTION_RADIO_SHOWCASE_STARTED)s_adv_active=true;else if(event->type==POTION_RADIO_SHOWCASE_STOPPED)s_adv_active=false;else if(event->type==POTION_RADIO_SHOWCASE_FAILED){s_adv_active=false;set_message_to("近距离展示启动失败",PAGE_SHOWCASE);}else if(event->request_id==s_request_id&&(s_page==PAGE_SCANNING||s_page==PAGE_RADAR)){if(event->type==POTION_RADIO_SCAN_FAILED){set_message_to("扫描失败\n请稍后重试",PAGE_HOME);}else if(s_scan_mode==SCAN_EXPLORE){update_radar(event);start_radio_scan(SCAN_EXPLORE,false);}else if(s_scan_mode==SCAN_LAB_CHECK){bool near=false;for(size_t i=0;i<event->count;++i)if(event->signals[i].source==POTION_SOURCE_WIFI&&event->signals[i].fingerprint==s_player.lab_fingerprint&&event->signals[i].rssi>=-72)near=true;if(near){s_page=PAGE_CAULDRON;s_selected=0;s_cauldron_count=0;}else set_message_to("登记的炼药房不在附近\n请回到登记地点",PAGE_HOME);}else{s_last_scan=*event;s_page=PAGE_LAB_LIST;s_selected=0;}}if(bsp_lvgl_lock(500)){render();bsp_lvgl_unlock();}}
+static void move_selection(int direction,unsigned count){if(count)s_selected=(s_selected+count+direction)%count;}
+static void execute_cauldron(void){size_t materials=available_material_types(),choice=s_selected;if(choice<materials){if(s_cauldron_count<4){int id=available_material_at(choice);if(id>=0)s_cauldron[s_cauldron_count++]=(uint16_t)id;}}else if(choice==materials){if(s_cauldron_count)s_cauldron_count--;}else if(choice==materials+1)s_cauldron_count=0;else if(s_cauldron_count<4)set_message_to("需要放入四份材料",PAGE_CAULDRON);else{uint16_t id;uint32_t seed;if(!potion_brew_candidate(&s_player,s_cauldron,&s_candidate,&id,&seed))set_message_to("材料数量不足\n请重新选择",PAGE_CAULDRON);else if(!save_candidate(&s_candidate))set_message_to("保存失败\n材料没有被消耗",PAGE_CAULDRON);else{s_player=s_candidate;s_result_potion=id;s_cauldron_count=0;s_selected=0;s_page=PAGE_BREW_RESULT;}}}
 
-static void process_input(const input_event_t *input) {
-    demo_nav_input_t nav_input = navigation_input(input->btn, input->event);
+static void process_key(bsp_btn_t button,bsp_btn_ev_t action){if(action!=BSP_BTN_PRESS&&potion_idle_note_input(&s_idle,uptime_ms())){screen_wake();return;}if(s_page==PAGE_RADAR&&button==BSP_BTN_UP&&action==BSP_BTN_LONG){s_hide_cooling=!s_hide_cooling;potion_clock_t clock=clock_now();rebuild_radar_cards(&clock);snprintf(s_radar_notice,sizeof(s_radar_notice),"%s",s_hide_cooling?"仅显示可采材料":"已显示冷却材料");if(bsp_lvgl_lock(500)){render();bsp_lvgl_unlock();}return;}if(s_page==PAGE_CAULDRON&&button==BSP_BTN_UP&&action==BSP_BTN_LONG){size_t materials=available_material_types();if(s_selected<materials){int id=available_material_at(s_selected);if(id>=0){s_material_detail_id=(uint16_t)id;s_material_detail_return=PAGE_CAULDRON;s_page=PAGE_MATERIAL_DETAIL;if(bsp_lvgl_lock(500)){render();bsp_lvgl_unlock();}}}return;}if(button==BSP_BTN_OK&&action==BSP_BTN_LONG){if(s_page==PAGE_HOME)return;if(s_page==PAGE_COLLECTION_REWARD){continue_explore();}else if(s_page==PAGE_MATERIAL_DETAIL){s_page=s_material_detail_return;}else if(s_page==PAGE_RECIPE_HISTORY){s_page=PAGE_RECIPE_POTIONS;s_selected=0;}else go_home();if(bsp_lvgl_lock(500)){render();bsp_lvgl_unlock();}return;}if(action!=BSP_BTN_CLICK)return;int direction=button==BSP_BTN_UP?-1:button==BSP_BTN_DOWN?1:0;if(s_page==PAGE_HOME){if(direction)s_home_selected=(s_home_selected+6+direction)%6;else if(button==BSP_BTN_OK){s_selected=0;switch(s_home_selected){case 0:begin_explore();break;case 1:s_page=PAGE_INVENTORY;break;case 2:if(s_player.lab_set)start_radio_scan(SCAN_LAB_CHECK,true);else set_message_to("请先在设置中\n登记炼药房",PAGE_HOME);break;case 3:s_page=PAGE_RECIPE_POTIONS;break;case 4:s_page=PAGE_SHOWCASE;break;default:s_page=PAGE_SETTINGS;break;}}}else if(s_page==PAGE_RADAR){if(direction){move_selection(direction,(unsigned)radar_card_count());if(bsp_lvgl_lock(500)){refresh_radar_selection();bsp_lvgl_unlock();}return;}else if(button==BSP_BTN_OK)collect_selected();}else if(s_page==PAGE_COLLECTION_REWARD&&button==BSP_BTN_OK){s_material_detail_id=s_collected_material;s_material_detail_return=PAGE_COLLECTION_REWARD;s_page=PAGE_MATERIAL_DETAIL;}else if(s_page==PAGE_INVENTORY){size_t count=potion_owned_material_types(&s_player);if(direction)move_selection(direction,count);else if(button==BSP_BTN_OK&&count){int id=owned_material_at(s_selected);if(id>=0){s_material_detail_id=(uint16_t)id;s_material_detail_return=PAGE_INVENTORY;s_page=PAGE_MATERIAL_DETAIL;}}}else if(s_page==PAGE_CAULDRON){unsigned count=(unsigned)available_material_types()+3;if(direction)move_selection(direction,count);else if(button==BSP_BTN_OK)execute_cauldron();}else if(s_page==PAGE_BREW_RESULT&&button==BSP_BTN_OK){s_page=PAGE_SHOWCASE;s_selected=0;}else if(s_page==PAGE_RECIPE_POTIONS){size_t count=potion_owned_potion_types(&s_player);if(direction)move_selection(direction,count);else if(button==BSP_BTN_OK&&count){s_recipe_potion=(uint16_t)owned_potion_at(s_selected);s_selected=0;s_page=PAGE_RECIPE_HISTORY;}}else if(s_page==PAGE_RECIPE_HISTORY){if(direction)move_selection(direction,(unsigned)potion_recipe_history_count(&s_player,s_recipe_potion));}else if(s_page==PAGE_SHOWCASE){unsigned count=(unsigned)potion_owned_potion_types(&s_player);if(direction)move_selection(direction,count);else if(button==BSP_BTN_OK&&count){if(s_adv_active)potion_radio_showcase_stop();else{int id=owned_potion_at(s_selected);if(!potion_radio_showcase_start(id,s_player.potion_seed[id]))set_message_to("无线模块正忙",PAGE_SHOWCASE);}}}else if(s_page==PAGE_SETTINGS){if(direction)move_selection(direction,4);else if(button==BSP_BTN_OK&&s_selected==0)start_radio_scan(SCAN_LAB_REGISTER,true);else if(button==BSP_BTN_OK&&s_selected==1){s_candidate=s_player;s_candidate.screen_timeout_index=(uint8_t)((screen_timeout_index()+1U)%SCREEN_TIMEOUT_COUNT);s_candidate.generation++;if(save_candidate(&s_candidate))s_player=s_candidate;else set_message_to("保存失败\n息屏时间未改变",PAGE_SETTINGS);}else if(button==BSP_BTN_OK&&s_selected==2)screen_off();else if(button==BSP_BTN_OK)set_message_to("统计信息显示在设置页",PAGE_SETTINGS);}else if(s_page==PAGE_LAB_LIST){unsigned count=0;for(size_t i=0;i<s_last_scan.count;++i)count+=s_last_scan.signals[i].source==POTION_SOURCE_WIFI&&s_last_scan.signals[i].ssid[0];if(direction)move_selection(direction,count);else if(button==BSP_BTN_OK&&count){int at=lab_signal_at(s_selected);potion_signal_t*sig=&s_last_scan.signals[at];if(sig->rssi<-72)set_message_to("请选择信号较强的无线网",PAGE_SETTINGS);else{s_candidate=s_player;s_candidate.lab_fingerprint=sig->fingerprint;s_candidate.lab_set=1;s_candidate.generation++;if(save_candidate(&s_candidate)){s_player=s_candidate;set_message_to("炼药房登记成功",PAGE_HOME);}else set_message_to("保存失败\n炼药房未改变",PAGE_SETTINGS);}}}else if(s_page==PAGE_MESSAGE&&button==BSP_BTN_OK){s_page=s_message_return;s_selected=0;}if(bsp_lvgl_lock(500)){render();bsp_lvgl_unlock();}}
 
-    if (s_navigation.active >= 0) {
-        demo_nav_result_t result = demo_navigation_handle(&s_navigation, nav_input, true);
-        const demo_entry_t *demo = &DEMOS[result.index];
-        if (result.action == DEMO_NAV_ACTION_EXIT) {
-            esp_err_t e = demo->stop ? demo->stop() : ESP_OK;
-            if (e != ESP_OK) {
-                ESP_LOGE(TAG, "%s 页面停止失败: %s", demo->name, esp_err_to_name(e));
-                return;
-            }
-            if (!bsp_lvgl_lock(500)) return;
-            demo->exit();
-            demo_navigation_complete_exit(&s_navigation);
-            enter_menu();
-            bsp_lvgl_unlock();
-        } else if (result.action == DEMO_NAV_ACTION_FORWARD) {
-            demo->key(input->btn, input->event);
-        }
-        return;
-    }
+static void app_task(void*arg){(void)arg;app_event_t event;for(;;){if(xQueueReceive(s_queue,&event,pdMS_TO_TICKS(APP_POLL_MS))==pdTRUE){if(event.kind==EVENT_KEY)process_key(event.button,event.action);else if(xQueueReceive(s_radio_queue,&s_radio_dispatch,0)==pdTRUE)process_radio(&s_radio_dispatch);}potion_clock_t clock=clock_now();checkpoint_cooldowns(&clock);uint32_t now=uptime_ms(),timeout=s_page==PAGE_RADAR?RADAR_IDLE_MS:SCREEN_TIMEOUT_MS[screen_timeout_index()];if(s_idle.screen_off){if(auto_shutdown_ready(&clock,now))terminal_shutdown(&clock);continue;}if(timeout&&potion_idle_poll(&s_idle,now,timeout))screen_off();else resume_screen_services();}}
+static void button_callback(bsp_btn_t button,bsp_btn_ev_t action,void*context){(void)context;app_event_t e={.kind=EVENT_KEY,.button=button,.action=action};(void)xQueueSendToFront(s_queue,&e,0);}
+static void radio_callback(const potion_radio_event_t*radio,void*context){(void)context;if(xQueueSend(s_radio_queue,radio,0)!=pdTRUE)return;app_event_t e={.kind=EVENT_RADIO};if(xQueueSend(s_queue,&e,0)!=pdTRUE)(void)xQueueReceive(s_radio_queue,&s_radio_dispatch,0);}
 
-    if (nav_input == DEMO_NAV_INPUT_OTHER || nav_input == DEMO_NAV_INPUT_OK_LONG) return;
-    if (!bsp_lvgl_lock(500)) return;
-    demo_nav_result_t result = demo_navigation_handle(
-        &s_navigation, nav_input, s_ok[s_navigation.selected]);
-    if (result.action == DEMO_NAV_ACTION_REFRESH) {
-        menu_refresh();
-        ui_pixel_mascot_jump(s_mascot);
-    } else if (result.action == DEMO_NAV_ACTION_ENTER) {
-        const demo_entry_t *demo = &DEMOS[result.index];
-        ui_pixel_mascot_jump(s_mascot);
-        lv_obj_delete(s_menu_scr);
-        s_menu_scr = NULL;
-        s_mascot = NULL;
-        demo->enter();
-        bsp_lvgl_unlock();
-
-        esp_err_t e = demo->start ? demo->start() : ESP_OK;
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "%s 页面启动失败: %s", demo->name, esp_err_to_name(e));
-        }
-        return;
-    }
-    bsp_lvgl_unlock();
-}
-
-static void input_task(void *arg) {
-    (void)arg;
-    input_event_t input;
-    for (;;) {
-        if (xQueueReceive(s_input_queue, &input, portMAX_DELAY) == pdTRUE) {
-            process_input(&input);
-        }
-    }
-}
-
-static esp_err_t input_dispatch_init(void) {
-    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
-    if (!s_input_queue) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(input_task, "demo_input", 4096, NULL, 5, &s_input_task) != pdPASS) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-static void input_dispatch_deinit(void) {
-    s_input_ready = false;
-    if (s_input_task) {
-        vTaskDelete(s_input_task);
-        s_input_task = NULL;
-    }
-    if (s_input_queue) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-    }
-}
-
-// button callbacks run on the shared esp_timer task; enqueue only and return immediately.
-static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
-    (void)user;
-    if (!s_input_ready || !s_input_queue) return;
-    const input_event_t input = { .btn = btn, .event = ev };
-    (void)xQueueSend(s_input_queue, &input, 0);
-}
-
-void app_main(void) {
-    ESP_LOGI(TAG, "FoloToy AI Passport BSP demo 启动");
-    esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
-    if (wakeup != ESP_SLEEP_WAKEUP_UNDEFINED) {
-        ESP_LOGI(TAG, "休眠唤醒原因: %d", wakeup);
-    }
-
-    bsp_i2c_init();
-    bsp_i2c_scan();
-
-    // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
-    // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
-    if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
-        ESP_LOGE(TAG, "显示/LVGL 初始化失败,demo 无法继续。"
-                      "检查 SPI 接线(MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",
-                 BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
-        return;
-    }
-    bsp_display_backlight(100);
-
-    demo_navigation_init(&s_navigation, DEMO_COUNT);
-
-    // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
-    s_ok[0] = true;                                   // Display 已确认可用
-    esp_err_t input_err = input_dispatch_init();
-    esp_err_t button_err = input_err == ESP_OK
-                         ? bsp_button_init(on_key, NULL)
-                         : ESP_ERR_INVALID_STATE;
-    s_ok[1] = input_err == ESP_OK && button_err == ESP_OK;
-    if (input_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键事件任务创建失败: %s", esp_err_to_name(input_err));
-    } else if (button_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键初始化失败: %s", esp_err_to_name(button_err));
-        input_dispatch_deinit();
-    }
-    s_ok[2] = (bsp_audio_init() == ESP_OK);
-    s_ok[3] = (bsp_battery_init() == ESP_OK);
-    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
-    s_ok[5] = true;
-    s_ok[6] = true;
-
-    if (bsp_lvgl_lock(1000)) {
-        enter_menu();
-        bsp_lvgl_unlock();
-        s_input_ready = true;
-    }
-
-    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
-             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
-}
+void app_main(void){ESP_LOGI(TAG,"Pocket Alchemist starting");s_session_id=esp_random();if(!s_session_id)s_session_id=1;(void)bsp_i2c_init();if(bsp_display_init()!=ESP_OK||!bsp_lvgl_init()){ESP_LOGE(TAG,"display failed (MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",BSP_LCD_MOSI,BSP_LCD_SCLK,BSP_LCD_CS,BSP_LCD_DC,BSP_LCD_BL);return;}bsp_display_backlight(SCREEN_BACKLIGHT);s_battery_ready=bsp_battery_init()==ESP_OK;if(s_battery_ready)s_battery_level=bsp_battery_soc();bool store_ready=potion_store_init(&s_player);if(!store_ready)potion_player_defaults(&s_player);else{s_candidate=s_player;potion_clock_t clock=clock_now();if(potion_cooldown_checkpoint(&s_candidate,&clock)){s_candidate.generation++;if(potion_store_request_save(&s_candidate))s_player=s_candidate;else ESP_LOGW(TAG,"startup cooldown checkpoint was not saved");}}s_last_cooldown_checkpoint_ms=uptime_ms();potion_idle_init(&s_idle,s_last_cooldown_checkpoint_ms);s_page=PAGE_HOME;s_queue=xQueueCreate(APP_QUEUE_DEPTH,sizeof(app_event_t));s_radio_queue=xQueueCreate(1,sizeof(potion_radio_event_t));if(!s_queue||!s_radio_queue||potion_radio_init(radio_callback,NULL)!=ESP_OK||xTaskCreate(app_task,"potion_app",7168,NULL,5,NULL)!=pdPASS||bsp_button_init(button_callback,NULL)!=ESP_OK){ESP_LOGE(TAG,"application services failed to initialize");return;}if(bsp_lvgl_lock(1000)){render();bsp_lvgl_unlock();}}

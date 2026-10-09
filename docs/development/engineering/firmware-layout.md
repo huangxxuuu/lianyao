@@ -4,22 +4,23 @@
 
 # Firmware Layout
 
-This repository is a minimal base for user-defined firmware targeting an
-ESP32-C3 with 8 MB Flash. Its default does not reserve product-specific
-identity, OTA, or unused data partitions.
+This repository targets an ESP32-C3 with 8 MB Flash. The Pocket Alchemist
+application reserves a save partition at the end of Flash so normal merged-image
+updates do not overwrite game progress.
 
 ## Default layout
 
-The default partition table contains exactly:
+The current application partition table contains:
 
 | Partition | Type/subtype | Offset | Size | Purpose |
 | --- | --- | ---: | ---: | --- |
 | `nvs` | data/NVS | `0x9000` | `0x6000` | ESP-IDF and application key-value storage |
 | `phy_init` | data/PHY | `0xF000` | `0x1000` | PHY initialization data |
-| `factory` | app/factory | `0x10000` | `0x7F0000` | The single application image; all remaining Flash |
+| `factory` | app/factory | `0x10000` | `0x7E0000` | The single application image |
+| `potion_save` | data/NVS | `0x7F0000` | `0x10000` | Pocket Alchemist progress and settings |
 
-The default has no OTA slots. This is a starting point, not a restriction on
-user firmware.
+The layout has no OTA slots. The application first reads `potion_save`; when it
+is empty, it attempts a one-time migration from the legacy `nvs` namespace.
 
 ## Custom layouts
 
@@ -78,3 +79,12 @@ and flash targets that do not overwrite those data regions. `idf.py erase-flash`
 erases all user data. Do not add it as a routine prerequisite: use it only when
 a complete erase is explicitly intended and any data that must be kept has
 been saved.
+
+For Pocket Alchemist, the generated merged image ends with the application
+payload and does not include or pad through the `potion_save` partition at
+`0x7F0000`. A normal sector-based write of that merged image therefore preserves
+progress created by a firmware version using this layout. A full-chip erase, or
+a flashing tool configured to erase the entire 8 MB device, still destroys the
+save partition. Progress stored only in the legacy low-address `nvs` partition
+cannot survive a merged-image write that already erased that region; migration
+is available when upgrading with a segmented flash that preserves legacy NVS.

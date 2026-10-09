@@ -54,6 +54,7 @@ class DeepSleepContractTest(unittest.TestCase):
         cls.display = read("components/bsp/src/bsp_display.c")
         cls.i2c = read("components/bsp/src/bsp_i2c.c")
         cls.demo = read("main/demo_low_power.c")
+        cls.potion_app = read("main/main.c")
 
     def test_es8311_force_sleep_sequence_is_complete_and_ordered(self) -> None:
         expected = [
@@ -152,6 +153,23 @@ class DeepSleepContractTest(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertLess(body.index("bsp_lvgl_lock(1000)"),
                         body.index("bsp_display_prepare_deep_sleep()"))
+
+    def test_potion_auto_shutdown_uses_the_terminal_sequence(self) -> None:
+        body = function_body(self.potion_app, "terminal_shutdown")
+        calls = [
+            "bsp_battery_sleep()",
+            "bsp_audio_sleep()",
+            "bsp_audio_prepare_deep_sleep()",
+            "bsp_i2c_prepare_deep_sleep()",
+            "bsp_display_prepare_deep_sleep()",
+            "esp_deep_sleep_start()",
+        ]
+        positions = [body.index(call) for call in calls]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(body.index("potion_store_request_save"), positions[0])
+        self.assertLess(body.index("bsp_lvgl_lock(1000)"),
+                        body.index("bsp_display_prepare_deep_sleep()"))
+        self.assertIn("ESP_SLEEP_WAKEUP_ALL", body)
 
 
 if __name__ == "__main__":

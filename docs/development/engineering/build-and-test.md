@@ -7,6 +7,28 @@
 Use ESP-IDF 5.5.3. On a clean machine or when the toolchain is missing, follow
 the [environment bootstrap](environment-setup.md) first.
 
+On Windows, the repository build wrapper runs the static checks, isolated
+firmware build, merged-image verification, and debug archive workflow in one
+command:
+
+```powershell
+.\tools\build-firmware.ps1
+```
+
+Use `-Mode Static` or `-Mode Firmware` to run only one part. The wrapper accepts
+`-IdfPath`, `-IdfToolsPath`, and `-PythonPath` when ESP-IDF is installed outside
+the detected standard locations. Static checks run through WSL; use
+`-WslDistribution <name>` when the default distribution does not contain the
+host-test dependencies.
+
+Every run prints stable `KEY=VALUE` result lines, returns a nonzero exit code on
+failure, and writes a full log under `build/logs/`. The machine-readable result
+is always replaced at `build/last-build-result.json`. A failed firmware build
+retains its isolated build directory and records it as
+`retained_validation_build` for diagnosis. A successful run removes that
+temporary directory unless `-KeepBuildDirectory` is specified. The script never
+flashes a device.
+
 > **No original-firmware backup is required before downloading (flashing) new
 > firmware to the device.** Reading out the installed firmware is not a
 > prerequisite. Flashing replaces the installed firmware and does not provide
